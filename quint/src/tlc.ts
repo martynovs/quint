@@ -19,6 +19,7 @@ import path from 'path'
 import os from 'os'
 import { apalacheDistDir } from './config'
 import { ErrorMessage } from './ErrorMessage'
+import AdmZip from 'adm-zip'
 
 // Default JVM configuration for TLC
 const JVM_MAX_HEAP = '-Xmx8G'
@@ -61,6 +62,7 @@ export interface TlcConfig {
   moduleName: string
   hasInvariant: boolean
   hasTemporal: boolean
+  constraint?: string
 }
 
 export type TlcError = {
@@ -80,7 +82,28 @@ function generateCfg(config: TlcConfig): string {
   if (config.hasTemporal) {
     cfg += `PROPERTY q_temporalProps\n`
   }
+  if (config.constraint) cfg += 'CONSTRAINT q_constraint\n'
   return cfg
+}
+
+export function emitDirectory(config: TlcConfig, directory: string, jarPath: string): string {
+  fs.mkdirSync(directory, { recursive: true })
+  fs.writeFileSync(path.join(directory, `${config.moduleName}.tla`), config.tlaCode)
+  const wrapper = `${config.moduleName}_Quint`
+  fs.writeFileSync(
+    path.join(directory, `${wrapper}.tla`),
+    `---- MODULE ${wrapper} ----\nEXTENDS ${config.moduleName}\n${
+      config.constraint ? `q_constraint == ${config.constraint}\n` : ''
+    }====\n`
+  )
+  fs.writeFileSync(path.join(directory, `${wrapper}.cfg`), generateCfg(config))
+  const jar = new AdmZip(jarPath)
+  for (const name of ['Apalache', 'Variants', 'Option']) {
+    const entry = jar.getEntry(`tla2sany/StandardModules/${name}.tla`)
+    if (!entry) throw new Error(`Missing ${name}.tla in ${jarPath}`)
+    fs.writeFileSync(path.join(directory, `${name}.tla`), entry.getData())
+  }
+  return path.join(directory, `${wrapper}.tla`)
 }
 
 function findApalacheJar(apalacheVersion: string): Either<string, string> {
@@ -99,13 +122,24 @@ export async function verify(
   config: TlcConfig,
   apalacheVersion: string,
   runtimeConfig: TlcRuntimeConfig = {},
-  verbosityLevel: number = 2
+  verbosityLevel: number = 2,
+  backend: 'tlc' | 'tlx' = 'tlc',
+  emitDir?: string
 ): Promise<TlcResult<void>> {
   const jarResult = findApalacheJar(apalacheVersion)
   if (jarResult.isLeft()) {
     return left(tlcErr(jarResult.value, false))
   }
   const jarPath = jarResult.value
+
+  if (emitDir) {
+    try {
+      emitDirectory(config, emitDir, jarPath)
+      return right(undefined)
+    } catch (err: any) {
+      return left(tlcErr(`Failed to emit directory: ${err.message}`, false))
+    }
+  }
 
   const maxHeap = runtimeConfig.maxHeap ?? JVM_MAX_HEAP
   const stackSize = runtimeConfig.stackSize ?? JVM_STACK_SIZE
@@ -115,11 +149,21 @@ export async function verify(
   const tlaFile = path.join(tmpDir, `${config.moduleName}.tla`)
   const cfgFile = path.join(tmpDir, `${config.moduleName}.cfg`)
 
-  fs.writeFileSync(tlaFile, config.tlaCode)
-  fs.writeFileSync(cfgFile, generateCfg(config))
+  let inputFile = tlaFile
+  if (backend === 'tlx' || config.constraint) {
+    try {
+      inputFile = emitDirectory(config, tmpDir, jarPath)
+    } catch (err: any) {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return left(tlcErr(`Failed to prepare checker: ${err.message}`, false))
+    }
+  } else {
+    fs.writeFileSync(tlaFile, config.tlaCode)
+    fs.writeFileSync(cfgFile, generateCfg(config))
+  }
 
   return new Promise(resolve => {
-    const proc = spawn('java', [
+    const javaArgs = [
       maxHeap,
       stackSize,
       `-Djava.io.tmpdir=${tmpDir}`,
@@ -131,8 +175,12 @@ export async function verify(
       String(workers),
       '-metadir',
       tmpDir,
-      tlaFile,
-    ])
+      inputFile,
+    ]
+    const proc =
+      backend === 'tlx'
+        ? spawn('tlx', ['check', inputFile, '-deadlock', '-workers', String(workers), '-metadir', tmpDir, '-I', tmpDir])
+        : spawn('java', javaArgs)
 
     proc.stdout.on('data', data => {
       if (verbosityLevel >= TLC_OUTPUT_VERBOSITY) {
@@ -154,13 +202,13 @@ export async function verify(
       } else if (code !== null && isViolationExitCode(code)) {
         resolve(left(tlcErr('found a counterexample', true)))
       } else {
-        resolve(left(tlcErr('TLC error (see output above)', false)))
+        resolve(left(tlcErr(`${backend.toUpperCase()} error (see output above)`, false)))
       }
     })
 
     proc.on('error', err => {
       fs.rmSync(tmpDir, { recursive: true, force: true })
-      resolve(left(tlcErr(`Failed to spawn TLC: ${err.message}`, false)))
+      resolve(left(tlcErr(`Failed to spawn ${backend.toUpperCase()}: ${err.message}`, false)))
     })
   })
 }

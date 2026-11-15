@@ -28,7 +28,7 @@ import {
 } from './cliReporting'
 import { PLACEHOLDERS, getInvariants, loadApalacheConfig, mkErrorMessage, toExpr } from './cliHelpers'
 import { verbosity } from './verbosity'
-import { mergeInMany } from '@sweet-monads/either'
+import { mergeInMany, right } from '@sweet-monads/either'
 
 // --------------------------------------------------------------------------------
 // TLC
@@ -74,8 +74,9 @@ export async function verifyWithTlcBackend(
     return cliErr('error', { ...verifying, errors: distResult.value.errors })
   }
 
-  if (verbosity.hasProgress(verbosityLevel)) {
-    console.log(chalk.green('[TLC]') + ' Running TLC model checker...\n')
+  if (verbosity.hasProgress(verbosityLevel) && !args.emitDir) {
+    const checker = args.backend === 'tlx' ? 'tlx' : 'TLC'
+    console.log(chalk.green(`[${checker}]`) + ` Running ${checker} model checker...\n`)
   }
 
   const startMs = Date.now()
@@ -85,12 +86,18 @@ export async function verifyWithTlcBackend(
       moduleName: prev.main!,
       hasInvariant: invariantsList.length > 0,
       hasTemporal: !!args.temporal,
+      constraint: args.constraint,
     },
     args.apalacheVersion,
     tlcRuntimeConfig,
-    verbosityLevel
+    verbosityLevel,
+    args.backend,
+    args.emitDir
   )
 
+  if (args.emitDir && tlcResult.isRight()) {
+    return right({ ...verifying, status: 'ok', errors: [] })
+  }
   return processTlcResult(tlcResult, startMs, verbosityLevel, verifying)
 }
 
