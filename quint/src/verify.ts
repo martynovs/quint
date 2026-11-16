@@ -85,6 +85,7 @@ export async function verifyWithTlcBackend(
       tlaCode: tlaResult.value,
       moduleName: prev.main!,
       hasInvariant: invariantsList.length > 0,
+      invariantNames: args.emitDir || args.backend === 'tlx' ? invariantsList : undefined,
       hasTemporal: !!args.temporal,
       constraint: args.constraint,
     },

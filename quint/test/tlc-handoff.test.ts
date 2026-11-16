@@ -18,7 +18,14 @@ describe('emitDirectory', () => {
         jar.addFile(`tla2sany/StandardModules/${name}.tla`, Buffer.from(name))
       jar.writeZip(lib)
       emitDirectory(
-        { tlaCode: 'compiled', moduleName: 'Model', hasInvariant: true, hasTemporal: true, constraint: 'now <= 6' },
+        {
+          tlaCode: 'compiled',
+          moduleName: 'Model',
+          hasInvariant: true,
+          hasTemporal: true,
+          invariantNames: ['safe', 'that_one'],
+          constraint: 'now <= 6',
+        },
         out,
         lib
       )
@@ -27,13 +34,17 @@ describe('emitDirectory', () => {
         .to.contain('EXTENDS Model')
         .and.contain('now <= 6')
       expect(fs.readFileSync(path.join(out, 'Model_Quint.cfg'), 'utf8')).to.equal(
-        'INIT q_init\nNEXT q_step\nINVARIANT q_inv\nPROPERTY q_temporalProps\nCONSTRAINT q_constraint\n'
+        'INIT q_init\nNEXT q_step\nINVARIANT q_inv\nINVARIANT q_inv_safe\nINVARIANT q_inv_that_one\nPROPERTY q_temporalProps\nCONSTRAINT q_constraint\n'
       )
+      expect(fs.readFileSync(path.join(out, 'Model_Quint.tla'), 'utf8'))
+        .to.contain('q_inv_safe == safe')
+        .and.contain('q_inv_that_one == that_one')
       expect(fs.readFileSync(path.join(out, 'Option.tla'), 'utf8')).to.equal('Option')
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }
   })
+
 })
 
 describe('checker handoff', () => {

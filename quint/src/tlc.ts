@@ -61,6 +61,7 @@ export interface TlcConfig {
   tlaCode: string
   moduleName: string
   hasInvariant: boolean
+  invariantNames?: string[]
   hasTemporal: boolean
   constraint?: string
 }
@@ -78,6 +79,7 @@ function generateCfg(config: TlcConfig): string {
 
   if (config.hasInvariant) {
     cfg += `INVARIANT q_inv\n`
+    for (const name of config.invariantNames ?? []) cfg += `INVARIANT q_inv_${name}\n`
   }
   if (config.hasTemporal) {
     cfg += `PROPERTY q_temporalProps\n`
@@ -93,6 +95,8 @@ export function emitDirectory(config: TlcConfig, directory: string, jarPath: str
   fs.writeFileSync(
     path.join(directory, `${wrapper}.tla`),
     `---- MODULE ${wrapper} ----\nEXTENDS ${config.moduleName}\n${
+      (config.invariantNames ?? []).map(name => `q_inv_${name} == ${name}\n`).join('')
+    }${
       config.constraint ? `q_constraint == ${config.constraint}\n` : ''
     }====\n`
   )
