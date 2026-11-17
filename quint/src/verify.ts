@@ -84,6 +84,7 @@ export async function verifyWithTlcBackend(
       tlaCode: tlaResult.value,
       moduleName: prev.main!,
       hasInvariant: invariantsList.length > 0,
+      invariantNames: invariantsList,
       hasTemporal: !!args.temporal,
     },
     args.apalacheVersion,

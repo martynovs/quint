@@ -60,6 +60,7 @@ export interface TlcConfig {
   tlaCode: string
   moduleName: string
   hasInvariant: boolean
+  invariantNames?: string[]
   hasTemporal: boolean
 }
 
@@ -71,16 +72,23 @@ export type TlcError = {
 
 export type TlcResult<T> = Either<TlcError, T>
 
-function generateCfg(config: TlcConfig): string {
+export function generateCfg(config: TlcConfig): string {
   let cfg = `INIT q_init\nNEXT q_step\n`
 
   if (config.hasInvariant) {
     cfg += `INVARIANT q_inv\n`
+    for (const name of config.invariantNames ?? []) cfg += `INVARIANT q_inv_${name}\n`
   }
   if (config.hasTemporal) {
     cfg += `PROPERTY q_temporalProps\n`
   }
   return cfg
+}
+
+/** The module that extends the compiled one and defines `q_inv_<name> == <name>` for each named invariant. */
+export function namedInvariantsModule(config: TlcConfig, wrapper: string): string {
+  const definitions = (config.invariantNames ?? []).map(name => `q_inv_${name} == ${name}\n`).join('')
+  return `---- MODULE ${wrapper} ----\nEXTENDS ${config.moduleName}\n${definitions}====\n`
 }
 
 function findApalacheJar(apalacheVersion: string): Either<string, string> {
@@ -112,10 +120,15 @@ export async function verify(
   const workers = runtimeConfig.workers ?? DEFAULT_WORKERS
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quint-tlc-'))
-  const tlaFile = path.join(tmpDir, `${config.moduleName}.tla`)
-  const cfgFile = path.join(tmpDir, `${config.moduleName}.cfg`)
+  const named = (config.invariantNames ?? []).length > 0
+  const wrapper = `${config.moduleName}_Quint`
+  // With named invariants TLC runs the wrapper module, which extends the compiled one.
+  const base = named ? wrapper : config.moduleName
+  const tlaFile = path.join(tmpDir, `${base}.tla`)
+  const cfgFile = path.join(tmpDir, `${base}.cfg`)
 
-  fs.writeFileSync(tlaFile, config.tlaCode)
+  fs.writeFileSync(path.join(tmpDir, `${config.moduleName}.tla`), config.tlaCode)
+  if (named) fs.writeFileSync(tlaFile, namedInvariantsModule(config, wrapper))
   fs.writeFileSync(cfgFile, generateCfg(config))
 
   return new Promise(resolve => {
