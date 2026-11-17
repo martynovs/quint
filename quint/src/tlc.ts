@@ -17,6 +17,7 @@ import { spawn } from 'child_process'
 import fs, { readFileSync } from 'fs'
 import path from 'path'
 import os from 'os'
+import AdmZip from 'adm-zip'
 import { apalacheDistDir } from './config'
 import { ErrorMessage } from './ErrorMessage'
 
@@ -62,6 +63,7 @@ export interface TlcConfig {
   hasInvariant: boolean
   invariantNames?: string[]
   hasTemporal: boolean
+  constraint?: string
 }
 
 export type TlcError = {
@@ -82,13 +84,33 @@ export function generateCfg(config: TlcConfig): string {
   if (config.hasTemporal) {
     cfg += `PROPERTY q_temporalProps\n`
   }
+  if (config.constraint) cfg += 'CONSTRAINT q_constraint\n'
   return cfg
 }
 
-/** The module that extends the compiled one and defines `q_inv_<name> == <name>` for each named invariant. */
+/**
+ * The module that extends the compiled one and defines `q_inv_<name> == <name>` for each named invariant,
+ * and `q_constraint` when there is a constraint.
+ */
 export function namedInvariantsModule(config: TlcConfig, wrapper: string): string {
   const definitions = (config.invariantNames ?? []).map(name => `q_inv_${name} == ${name}\n`).join('')
-  return `---- MODULE ${wrapper} ----\nEXTENDS ${config.moduleName}\n${definitions}====\n`
+  const constraint = config.constraint ? `q_constraint == ${config.constraint}\n` : ''
+  return `---- MODULE ${wrapper} ----\nEXTENDS ${config.moduleName}\n${definitions}${constraint}====\n`
+}
+
+export function emitDirectory(config: TlcConfig, directory: string, jarPath: string): string {
+  fs.mkdirSync(directory, { recursive: true })
+  fs.writeFileSync(path.join(directory, `${config.moduleName}.tla`), config.tlaCode)
+  const wrapper = `${config.moduleName}_Quint`
+  fs.writeFileSync(path.join(directory, `${wrapper}.tla`), namedInvariantsModule(config, wrapper))
+  fs.writeFileSync(path.join(directory, `${wrapper}.cfg`), generateCfg(config))
+  const jar = new AdmZip(jarPath)
+  for (const name of ['Apalache', 'Variants', 'Option']) {
+    const entry = jar.getEntry(`tla2sany/StandardModules/${name}.tla`)
+    if (!entry) throw new Error(`Missing ${name}.tla in ${jarPath}`)
+    fs.writeFileSync(path.join(directory, `${name}.tla`), entry.getData())
+  }
+  return path.join(directory, `${wrapper}.tla`)
 }
 
 function findApalacheJar(apalacheVersion: string): Either<string, string> {
@@ -107,7 +129,9 @@ export async function verify(
   config: TlcConfig,
   apalacheVersion: string,
   runtimeConfig: TlcRuntimeConfig = {},
-  verbosityLevel: number = 2
+  verbosityLevel: number = 2,
+  backend: 'tlc' | 'tlx' = 'tlc',
+  emitDir?: string
 ): Promise<TlcResult<void>> {
   const jarResult = findApalacheJar(apalacheVersion)
   if (jarResult.isLeft()) {
@@ -115,24 +139,39 @@ export async function verify(
   }
   const jarPath = jarResult.value
 
+  if (emitDir) {
+    try {
+      emitDirectory(config, emitDir, jarPath)
+      return right(undefined)
+    } catch (err: any) {
+      return left(tlcErr(`Failed to emit directory: ${err.message}`, false))
+    }
+  }
+
   const maxHeap = runtimeConfig.maxHeap ?? JVM_MAX_HEAP
   const stackSize = runtimeConfig.stackSize ?? JVM_STACK_SIZE
   const workers = runtimeConfig.workers ?? DEFAULT_WORKERS
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quint-tlc-'))
   const named = (config.invariantNames ?? []).length > 0
-  const wrapper = `${config.moduleName}_Quint`
-  // With named invariants TLC runs the wrapper module, which extends the compiled one.
-  const base = named ? wrapper : config.moduleName
-  const tlaFile = path.join(tmpDir, `${base}.tla`)
-  const cfgFile = path.join(tmpDir, `${base}.cfg`)
+  const tlaFile = path.join(tmpDir, `${config.moduleName}.tla`)
+  const cfgFile = path.join(tmpDir, `${config.moduleName}.cfg`)
 
-  fs.writeFileSync(path.join(tmpDir, `${config.moduleName}.tla`), config.tlaCode)
-  if (named) fs.writeFileSync(tlaFile, namedInvariantsModule(config, wrapper))
-  fs.writeFileSync(cfgFile, generateCfg(config))
+  let inputFile = tlaFile
+  if (backend === 'tlx' || config.constraint || named) {
+    try {
+      inputFile = emitDirectory(config, tmpDir, jarPath)
+    } catch (err: any) {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return left(tlcErr(`Failed to prepare checker: ${err.message}`, false))
+    }
+  } else {
+    fs.writeFileSync(tlaFile, config.tlaCode)
+    fs.writeFileSync(cfgFile, generateCfg(config))
+  }
 
   return new Promise(resolve => {
-    const proc = spawn('java', [
+    const javaArgs = [
       maxHeap,
       stackSize,
       `-Djava.io.tmpdir=${tmpDir}`,
@@ -144,8 +183,12 @@ export async function verify(
       String(workers),
       '-metadir',
       tmpDir,
-      tlaFile,
-    ])
+      inputFile,
+    ]
+    const proc =
+      backend === 'tlx'
+        ? spawn('tlx', ['check', inputFile, '-deadlock', '-workers', String(workers), '-metadir', tmpDir, '-I', tmpDir])
+        : spawn('java', javaArgs)
 
     proc.stdout.on('data', data => {
       if (verbosityLevel >= TLC_OUTPUT_VERBOSITY) {
@@ -167,13 +210,13 @@ export async function verify(
       } else if (code !== null && isViolationExitCode(code)) {
         resolve(left(tlcErr('found a counterexample', true)))
       } else {
-        resolve(left(tlcErr('TLC error (see output above)', false)))
+        resolve(left(tlcErr(`${backend.toUpperCase()} error (see output above)`, false)))
       }
     })
 
     proc.on('error', err => {
       fs.rmSync(tmpDir, { recursive: true, force: true })
-      resolve(left(tlcErr(`Failed to spawn TLC: ${err.message}`, false)))
+      resolve(left(tlcErr(`Failed to spawn ${backend.toUpperCase()}: ${err.message}`, false)))
     })
   })
 }
